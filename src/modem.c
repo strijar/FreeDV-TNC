@@ -13,6 +13,7 @@
 #include "modem.h"
 #include "util.h"
 #include "audio.h"
+#include "ptt.h"
 
 static struct freedv    *freedv;
 static int              frame_bytes;
@@ -73,7 +74,8 @@ void modem_send(const uint8_t *buf, size_t len) {
     int         part;
     uint16_t    crc;
 
-    send_preamble();
+    dump("Modem", buf, len);
+    ptt_set(true);
 
     while (left > 0) {
         part = left < payload_bytes ? left : payload_bytes;
@@ -85,11 +87,14 @@ void modem_send(const uint8_t *buf, size_t len) {
         frame_tx[frame_bytes - 2] = crc >> 8;
         frame_tx[frame_bytes - 1] = crc & 0xFF;
 
+        send_preamble();
         send_data();
+        send_postamble();
 
         left -= part;
         buf += part;
     }
 
-    send_postamble();
+    audio_wait();
+    ptt_set(false);
 }

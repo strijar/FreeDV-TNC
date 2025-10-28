@@ -8,9 +8,7 @@
 
 #pragma once
 
-#include <stddef.h>
-#include <stdint.h>
+#include <stdbool.h>
 
-void audio_init();
-void audio_send(const int16_t *buf, size_t len);
-void audio_wait();
+void ptt_init();
+void ptt_set(bool on);

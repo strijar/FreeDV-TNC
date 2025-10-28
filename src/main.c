@@ -17,11 +17,13 @@
 #include "tcp.h"
 #include "modem.h"
 #include "audio.h"
+#include "ptt.h"
 
 int main() {
-    audio_init();
     tcp_init(8080);
     modem_open(FREEDV_MODE_DATAC0, NULL);
+    ptt_init();
+    audio_init();
 
     while (true) {
         tcp_read();
