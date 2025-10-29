@@ -15,16 +15,17 @@
 #include <pulse/pulseaudio.h>
 
 #include "audio.h"
+#include "modem.h"
 
-#define PLAY_RATE_MS    100
-#define CAPTURE_RATE_MS 10
+#define PLAY_RATE_MS    25
+#define CAPTURE_RATE_MS 25
 
-static pa_threaded_mainloop *mloop;
-static pa_mainloop_api      *mlapi;
-static pa_context           *ctx;
+static pa_threaded_mainloop *mloop = NULL;
+static pa_mainloop_api      *mlapi = NULL;
+static pa_context           *ctx = NULL;
 
-static pa_stream            *play_stm;
-static pa_stream            *capture_stm;
+static pa_stream            *play_stm = NULL;
+static pa_stream            *capture_stm = NULL;
 
 static void on_state_change(pa_context *c, void *userdata) {
     pa_threaded_mainloop_signal(mloop, 0);
@@ -34,11 +35,13 @@ static void read_callback(pa_stream *s, size_t nbytes, void *udata) {
     int16_t *buf = NULL;
 
     pa_stream_peek(capture_stm, (const void **) &buf, &nbytes);
+    modem_recv(buf, nbytes / 2);
     pa_stream_drop(capture_stm);
 }
 
 void audio_init() {
     mloop = pa_threaded_mainloop_new();
+
     pa_threaded_mainloop_start(mloop);
 
     mlapi = pa_threaded_mainloop_get_api(mloop);
@@ -57,7 +60,7 @@ void audio_init() {
 
     pa_sample_spec  spec = {
         .rate = 8000,
-        .format = PA_SAMPLE_S16NE,
+        .format = PA_SAMPLE_S16LE,
         .channels = 1
     };
 
@@ -66,7 +69,7 @@ void audio_init() {
     /* Play */
 
     attr.fragsize = pa_usec_to_bytes(PLAY_RATE_MS * PA_USEC_PER_MSEC, &spec);
-    attr.tlength = attr.fragsize * 8;
+    attr.tlength = attr.fragsize * 30;
 
     play_stm = pa_stream_new(ctx, "FreeDV TNC Play", &spec, NULL);
 
@@ -86,19 +89,52 @@ void audio_init() {
     pa_threaded_mainloop_unlock(mloop);
 }
 
-void audio_send(const int16_t *buf, size_t len) {
-    pa_threaded_mainloop_lock(mloop);
-    int res = pa_stream_write(play_stm, buf, len * 2, NULL, 0, PA_SEEK_RELATIVE);
-    pa_threaded_mainloop_unlock(mloop);
+void audio_send(const int16_t *buf, int len) {
+    if (mloop == NULL || play_stm == NULL || buf == NULL || len == 0) {
+        return;
+    }
 
-    if (res < 0) {
-        printf("pa_stream_write() failed: %s", pa_strerror(pa_context_errno(ctx)));
+    uint8_t *ptr = (uint8_t *) buf;
+    int     bytes = len * 2;
+
+    while (bytes > 0) {
+        size_t size;
+
+        pa_threaded_mainloop_lock(mloop);
+        size = pa_stream_writable_size(play_stm);
+        pa_threaded_mainloop_unlock(mloop);
+
+        if (size > 256) {
+            if (bytes < size) {
+                size = bytes;
+            } else {
+                size = 256;
+            }
+
+            pa_threaded_mainloop_lock(mloop);
+            int res = pa_stream_write(play_stm, ptr, size, NULL, 0, PA_SEEK_RELATIVE);
+            pa_threaded_mainloop_unlock(mloop);
+
+            if (res < 0) {
+                printf("pa_stream_write() failed: %s", pa_strerror(pa_context_errno(ctx)));
+                return;
+            }
+
+            bytes -= size;
+            ptr += size;
+        } else {
+            usleep(1000);
+        }
     }
 }
 
 void audio_wait() {
     pa_operation *op;
     int r;
+
+    if (mloop == NULL || play_stm == NULL) {
+        return;
+    }
 
     pa_threaded_mainloop_lock(mloop);
     op = pa_stream_drain(play_stm, NULL, NULL);

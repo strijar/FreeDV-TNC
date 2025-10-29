@@ -20,10 +20,10 @@
 #include "ptt.h"
 
 int main() {
-    tcp_init(8080);
-    modem_open(FREEDV_MODE_DATAC0, NULL);
     ptt_init();
     audio_init();
+    modem_init();
+    tcp_init(8080);
 
     while (true) {
         tcp_read();

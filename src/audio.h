@@ -12,5 +12,5 @@
 #include <stdint.h>
 
 void audio_init();
-void audio_send(const int16_t *buf, size_t len);
+void audio_send(const int16_t *buf, int len);
 void audio_wait();

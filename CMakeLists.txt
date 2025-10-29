@@ -12,4 +12,11 @@ add_executable(${PROJECT_NAME})
 
 add_subdirectory(src)
 
-target_link_libraries(${PROJECT_NAME} PRIVATE codec2 pulse pulse-simple)
+target_link_libraries(${PROJECT_NAME} PRIVATE codec2 pulse pulse-simple gpiod liquid)
+
+#target_compile_options(${PROJECT_NAME} PRIVATE -fsanitize=address -fsanitize=undefined -fno-sanitize-recover)
+#target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address -fsanitize=undefined -fno-sanitize-recover -static-libasan -static-libubsan)
+
+#set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS "-save-temps")
+#target_compile_options(${PROJECT_NAME} PRIVATE -g -pg)
+#target_link_options(${PROJECT_NAME} PRIVATE -g -pg)

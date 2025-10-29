@@ -13,6 +13,7 @@
 
 #include <codec2/freedv_api.h>
 
-void modem_open(int mode, struct freedv_advanced *adv);
+void modem_init();
 
 void modem_send(const uint8_t *buf, size_t len);
+void modem_recv(const int16_t *buf, size_t len);

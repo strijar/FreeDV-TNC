@@ -12,3 +12,4 @@
 
 void ptt_init();
 void ptt_set(bool on);
+bool ptt_is_on();
