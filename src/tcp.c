@@ -16,11 +16,12 @@
 
 #include "util.h"
 #include "hdlc.h"
+#include "modem.h"
 
 static struct sockaddr_in   address;
 static int                  server_fd;
-static int                  client_fd;
-static uint8_t              buf_in[1024] = {0};
+static int                  client_fd = 0;
+static uint8_t              buf_in[MTU] = {0};
 
 void tcp_init(uint32_t port) {
     int addrlen = sizeof(address);
@@ -70,11 +71,15 @@ void tcp_read() {
             break;
         }
 
-        dump("Data", buf_in, res);
+        dump("Data in", buf_in, res);
         hdlc_decode(buf_in, res);
     }
 }
 
 void tcp_send(char *buf, size_t len) {
-    send(client_fd, buf, len, 0);
+    dump("Data out", buf, len);
+
+    if (client_fd) {
+        send(client_fd, buf, len, 0);
+    }
 }

@@ -13,6 +13,8 @@
 
 #include <codec2/freedv_api.h>
 
+#define MTU 1024
+
 void modem_init();
 
 void modem_send(const uint8_t *buf, size_t len);

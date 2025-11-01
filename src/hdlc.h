@@ -12,3 +12,4 @@
 #include <stdint.h>
 
 void hdlc_decode(const uint8_t *buf, size_t len);
+void hdlc_encode(const uint8_t *buf, size_t len);
