@@ -22,5 +22,5 @@ float signal_db(const int16_t *buf, size_t len) {
         sum = x * x;
     }
 
-    return 10.0f * log10f(sum);
+    return sum > 0 ? 10.0f * log10f(sum) : -60.0f;
 }

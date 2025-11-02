@@ -46,7 +46,10 @@ static int16_t          *samples_tx = NULL;
 static int              samples_num;
 static int              samples_max;
 
-static float            signal_rx = 0;
+static uint32_t         tx_timeout = 0;
+static bool             tx_enable = false;
+
+static float            db_avr = 0.0f;
 static size_t           samples_rx_index = 0;
 static int16_t          *samples_rx = NULL;
 static uint8_t          *bytes_rx = NULL;
@@ -56,7 +59,7 @@ static uint8_t          frame_rx[MTU];
 static size_t           frame_rx_index = 0;
 
 void modem_init() {
-    struct freedv_advanced  adv = {0, 4, 400, 8000, 1000, 400, "H_256_512_4"};
+    struct freedv_advanced  adv = {0, 4, 500, 8000, 1000, 500, "H_256_768_22"};
     int                     mode = FREEDV_MODE_FSK_LDPC;
 
     freedv = freedv_open_advanced(mode, &adv);
@@ -222,6 +225,10 @@ void modem_send(const uint8_t *buf, size_t len) {
         return;
     }
 
+    while (!tx_enable) {
+        usleep(100000);
+    }
+
     ptt_set(true);
     send_silence(4000);
     send_preamble();
@@ -262,7 +269,30 @@ void modem_recv(const int16_t *buf, size_t len) {
         return;
     }
 
-    signal_rx = signal_db(buf, len);
+    float db = signal_db(buf, len);
+
+    if (db_avr == 0.0f) {
+        db_avr = db;
+    } else {
+        db_avr = db_avr * 0.75f + db * 0.25f;
+    }
+
+    if (tx_enable) {
+        if (db_avr > -55.0f) {
+            tx_enable = false;
+            tx_timeout = 0;
+            printf("Air busy\n");
+        }
+    } else {
+        if (db_avr < -60.0f) {
+            if (tx_timeout > 1000) {
+                tx_enable = true;
+                printf("Air free\n");
+            } else {
+                tx_timeout += len;
+            }
+        }
+    }
 
     memcpy(&samples_rx[samples_rx_index], buf, len * sizeof(int16_t));
     samples_rx_index += len;
