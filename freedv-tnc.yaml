@@ -1,0 +1,16 @@
+ptt: { port: 0, pin: 7 }
+tcp_port: 8080
+
+modem:
+    fsk: 4
+    rate: 500
+    first_tone: 1000
+    tone_spacing: 600
+    codename: H_256_768_22
+
+send:
+    sig_freq: 440
+    modem_bytes: 64
+    modem_wait: 3000
+    sinad_start: 300
+    sinad_stop: 3000

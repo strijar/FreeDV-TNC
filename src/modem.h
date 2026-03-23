@@ -15,7 +15,14 @@
 
 #define MTU 1024
 
-void modem_init();
+typedef enum {
+    MODEM_WORK = 0,
+    MODEM_SEND,
+    MODEM_RECV,
+    MODEM_RECV_SIG
+} modem_mode_t;
+
+void modem_init(modem_mode_t mode);
 
 void modem_send(const uint8_t *buf, size_t len);
 void modem_recv(const int16_t *buf, size_t len);

@@ -18,6 +18,8 @@
 #include "ptt.h"
 #include "hdlc.h"
 #include "tcp.h"
+#include "config.h"
+#include "sinad.h"
 
 typedef enum {
     FRAME_SINGLE = 0,
@@ -58,11 +60,22 @@ static uint8_t          prev_id_rx = 0;
 static uint8_t          frame_rx[MTU];
 static size_t           frame_rx_index = 0;
 
-void modem_init() {
-    struct freedv_advanced  adv = {0, 4, 500, 8000, 1000, 500, "H_256_768_22"};
-    int                     mode = FREEDV_MODE_FSK_LDPC;
+static modem_mode_t     modem_mode;
 
-    freedv = freedv_open_advanced(mode, &adv);
+void modem_init(modem_mode_t mode) {
+    modem_mode = mode;
+
+    struct freedv_advanced  adv = {
+        .interleave_frames = 0,
+        .M = config->modem.fsk,
+        .Rs = config->modem.rate,
+        .Fs = 8000,
+        .first_tone = config->modem.first_tone,
+        .tone_spacing = config->modem.tone_spacing,
+        .codename = config->modem.codename
+    };
+
+    freedv = freedv_open_advanced(FREEDV_MODE_FSK_LDPC, &adv);
 
     freedv_set_verbose(freedv, 0);
     freedv_set_frames_per_burst(freedv, 1);
@@ -79,16 +92,14 @@ void modem_init() {
     samples_rx = (int16_t *) malloc(samples_max * sizeof(int16_t) * 2);
     bytes_rx = (uint8_t *) malloc(frame_bytes);
 
-    if (mode == FREEDV_MODE_FSK_LDPC) {
-        printf("Frequency: Fs: %4.1f Hz Rs: %5.0f Hz Tone1: %5.0f Hz Shift: "
-              "%5.0f Hz M: %d \n",
-              (float)adv.Fs, (float)adv.Rs, (float)adv.first_tone,
-              (float)adv.tone_spacing, adv.M);
+    printf("Frequency: Fs: %4.1f Hz Rs: %5.0f Hz Tone1: %5.0f Hz Shift: "
+          "%5.0f Hz M: %d \n",
+          (float)adv.Fs, (float)adv.Rs, (float)adv.first_tone,
+          (float)adv.tone_spacing, adv.M);
 
-        if (adv.tone_spacing < adv.Rs) {
-            printf("Need shift: %d > Rs: %d\n", adv.tone_spacing, adv.Rs);
-            exit(1);
-        }
+    if (adv.tone_spacing < adv.Rs) {
+        printf("Need shift: %d > Rs: %d\n", adv.tone_spacing, adv.Rs);
+        exit(1);
     }
 }
 
@@ -156,7 +167,7 @@ static void encode_frame(const uint8_t *buf, size_t len, fragment_t type, uint8_
 void decode_frame(uint8_t *buf, int len) {
     uint8_t header = buf[0];
     uint8_t append = 0;
-    bool    send = false;
+    bool    done = false;
     bool    reset = false;
     uint8_t id;
 
@@ -165,7 +176,7 @@ void decode_frame(uint8_t *buf, int len) {
 
     if ((header & HEADER_SINGLE_MASK) == HEADER_SINGLE) {
         append = header & ~HEADER_SINGLE_MASK;
-        send = true;
+        done = true;
     } else if ((header & HEADER_BEGIN_MASK) == HEADER_BEGIN) {
         append = len;
         prev_frag_rx = FRAME_BEGIN;
@@ -190,7 +201,7 @@ void decode_frame(uint8_t *buf, int len) {
         if (prev_frag_rx == FRAME_BEGIN || prev_frag_rx == FRAME_FRAG) {
             if (prev_id_rx == 0) {
                 append = header & ~HEADER_END_MASK;
-                send = true;
+                done = true;
             } else {
                 printf("Lost frag\n");
                 reset = true;
@@ -206,8 +217,20 @@ void decode_frame(uint8_t *buf, int len) {
         frame_rx_index += append;
     }
 
-    if (send) {
-        hdlc_encode(frame_rx, frame_rx_index);
+    if (done) {
+        switch (modem_mode) {
+            case MODEM_WORK:
+                hdlc_encode(frame_rx, frame_rx_index);
+                break;
+
+            case MODEM_RECV:
+                printf("Correct packet %i bytes\n", frame_rx_index);
+                break;
+
+            default:
+                break;
+        }
+
         reset = true;
     }
 
@@ -225,8 +248,10 @@ void modem_send(const uint8_t *buf, size_t len) {
         return;
     }
 
-    while (!tx_enable) {
-        usleep(100000);
+    if (modem_mode == MODEM_WORK) {
+        while (!tx_enable) {
+            usleep(100000);
+        }
     }
 
     ptt_set(true);
@@ -264,19 +289,7 @@ void modem_send(const uint8_t *buf, size_t len) {
     ptt_set(false);
 }
 
-void modem_recv(const int16_t *buf, size_t len) {
-    if (ptt_is_on() || freedv == NULL || samples_rx == NULL) {
-        return;
-    }
-
-    float db = signal_db(buf, len);
-
-    if (db_avr == 0.0f) {
-        db_avr = db;
-    } else {
-        db_avr = db_avr * 0.75f + db * 0.25f;
-    }
-
+static void tx_state(float db, size_t len) {
     if (tx_enable) {
         if (db_avr > -55.0f) {
             tx_enable = false;
@@ -292,6 +305,39 @@ void modem_recv(const int16_t *buf, size_t len) {
                 tx_timeout += len;
             }
         }
+    }
+}
+
+void modem_recv(const int16_t *buf, size_t len) {
+    if (ptt_is_on()) {
+        return;
+    }
+
+    float db = signal_db(buf, len);
+
+    if (db_avr == 0.0f) {
+        db_avr = db;
+    } else {
+        float x = (modem_mode == MODEM_WORK) ? 0.75f : 0.99f;
+
+        db_avr = db_avr * x + db * (1.0f - x);
+    }
+
+    switch (modem_mode) {
+        case MODEM_WORK:
+            tx_state(db, len);
+            break;
+
+        case MODEM_RECV_SIG:
+            sinad_calc(buf, len);
+            return;
+
+        default:
+            break;
+    }
+
+    if (freedv == NULL || samples_rx == NULL) {
+        return;
     }
 
     memcpy(&samples_rx[samples_rx_index], buf, len * sizeof(int16_t));
@@ -312,7 +358,17 @@ void modem_recv(const int16_t *buf, size_t len) {
             struct MODEM_STATS stats;
 
             freedv_get_modem_extended_stats(freedv, &stats);
-            decode_frame(bytes_rx, nbytes);
+
+            switch (modem_mode) {
+                case MODEM_RECV:
+                    printf("...received %i bytes, %.1fdb\n", nbytes, db_avr);
+                case MODEM_WORK:
+                    decode_frame(bytes_rx, nbytes);
+                    break;
+
+                default:
+                    break;
+            }
         }
 
         nin = freedv_nin(freedv);
