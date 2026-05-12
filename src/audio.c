@@ -12,145 +12,222 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <string.h>
-#include <pulse/pulseaudio.h>
+#include <alsa/asoundlib.h>
 
 #include "audio.h"
 #include "modem.h"
 
+#define SAMPLE_RATE     8000
+#define CHANNELS        1
 #define PLAY_RATE_MS    25
 #define CAPTURE_RATE_MS 25
+#define ALSA_DEVICE     "default"
 
-static pa_threaded_mainloop *mloop = NULL;
-static pa_mainloop_api      *mlapi = NULL;
-static pa_context           *ctx = NULL;
+/* Frames per period derived from rate and interval */
+#define PLAY_PERIOD_FRAMES    ((SAMPLE_RATE * PLAY_RATE_MS)    / 1000)
+#define CAPTURE_PERIOD_FRAMES ((SAMPLE_RATE * CAPTURE_RATE_MS) / 1000)
 
-static pa_stream            *play_stm = NULL;
-static pa_stream            *capture_stm = NULL;
+static snd_pcm_t    *play_pcm    = NULL;
+static snd_pcm_t    *capture_pcm = NULL;
 
-static void on_state_change(pa_context *c, void *userdata) {
-    pa_threaded_mainloop_signal(mloop, 0);
-}
+static pthread_t     capture_thread;
+static volatile bool capture_running = false;
 
-static void read_callback(pa_stream *s, size_t nbytes, void *udata) {
-    int16_t *buf = NULL;
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                             */
+/* ------------------------------------------------------------------ */
 
-    pa_stream_peek(capture_stm, (const void **) &buf, &nbytes);
-    modem_recv(buf, nbytes / 2);
-    pa_stream_drop(capture_stm);
-}
+static int set_hw_params(snd_pcm_t *pcm, snd_pcm_uframes_t period_frames,
+                         unsigned int periods)
+{
+    snd_pcm_hw_params_t *hw;
+    int err;
 
-void audio_init() {
-    mloop = pa_threaded_mainloop_new();
+    snd_pcm_hw_params_alloca(&hw);
 
-    pa_threaded_mainloop_start(mloop);
-
-    mlapi = pa_threaded_mainloop_get_api(mloop);
-    ctx = pa_context_new(mlapi, "FreeDV TNC");
-
-    pa_threaded_mainloop_lock(mloop);
-    pa_context_set_state_callback(ctx, on_state_change, NULL);
-    pa_context_connect(ctx, NULL, 0, NULL);
-    pa_threaded_mainloop_unlock(mloop);
-
-    while (PA_CONTEXT_READY != pa_context_get_state(ctx))  {
-        pa_threaded_mainloop_wait(mloop);
+    if ((err = snd_pcm_hw_params_any(pcm, hw)) < 0) {
+        fprintf(stderr, "audio: hw_params_any: %s\n", snd_strerror(err));
+        return err;
     }
 
-    pa_buffer_attr  attr;
+    if ((err = snd_pcm_hw_params_set_access(pcm, hw,
+                    SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
+        fprintf(stderr, "audio: set_access: %s\n", snd_strerror(err));
+        return err;
+    }
 
-    pa_sample_spec  spec = {
-        .rate = 8000,
-        .format = PA_SAMPLE_S16LE,
-        .channels = 1
-    };
+    if ((err = snd_pcm_hw_params_set_format(pcm, hw,
+                    SND_PCM_FORMAT_S16_LE)) < 0) {
+        fprintf(stderr, "audio: set_format: %s\n", snd_strerror(err));
+        return err;
+    }
 
-    memset(&attr, 0xff, sizeof(attr));
+    if ((err = snd_pcm_hw_params_set_channels(pcm, hw, CHANNELS)) < 0) {
+        fprintf(stderr, "audio: set_channels: %s\n", snd_strerror(err));
+        return err;
+    }
 
-    /* Play */
+    unsigned int rate = SAMPLE_RATE;
 
-    attr.fragsize = pa_usec_to_bytes(PLAY_RATE_MS * PA_USEC_PER_MSEC, &spec);
-    attr.tlength = attr.fragsize * 30;
+    if ((err = snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, 0)) < 0) {
+        fprintf(stderr, "audio: set_rate: %s\n", snd_strerror(err));
+        return err;
+    }
 
-    play_stm = pa_stream_new(ctx, "FreeDV TNC Play", &spec, NULL);
+    snd_pcm_uframes_t pf = period_frames;
 
-    pa_threaded_mainloop_lock(mloop);
-    pa_stream_connect_playback(play_stm, NULL, &attr, PA_STREAM_ADJUST_LATENCY, NULL, NULL);
-    pa_threaded_mainloop_unlock(mloop);
+    if ((err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &pf, 0)) < 0) {
+        fprintf(stderr, "audio: set_period_size: %s\n", snd_strerror(err));
+        return err;
+    }
 
-    /* Capture */
+    snd_pcm_uframes_t buf_frames = pf * periods;
 
-    attr.fragsize = attr.tlength = pa_usec_to_bytes(CAPTURE_RATE_MS * PA_USEC_PER_MSEC, &spec);
+    if ((err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw,
+                    &buf_frames)) < 0) {
+        fprintf(stderr, "audio: set_buffer_size: %s\n", snd_strerror(err));
+        return err;
+    }
 
-    capture_stm = pa_stream_new(ctx, "FreeDV TNC Capture", &spec, NULL);
+    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
+        fprintf(stderr, "audio: hw_params: %s\n", snd_strerror(err));
+        return err;
+    }
 
-    pa_threaded_mainloop_lock(mloop);
-    pa_stream_set_read_callback(capture_stm, read_callback, NULL);
-    pa_stream_connect_record(capture_stm, NULL, &attr, PA_STREAM_ADJUST_LATENCY);
-    pa_threaded_mainloop_unlock(mloop);
+    return 0;
 }
 
-void audio_send(const int16_t *buf, int len) {
-    if (mloop == NULL || play_stm == NULL || buf == NULL || len == 0) {
+/* ------------------------------------------------------------------ */
+/*  Capture thread                                                      */
+/* ------------------------------------------------------------------ */
+
+static void *capture_thread_fn(void *arg)
+{
+    (void) arg;
+
+    const snd_pcm_uframes_t frames = CAPTURE_PERIOD_FRAMES;
+    int16_t buf[frames];
+
+    while (capture_running) {
+        snd_pcm_sframes_t n = snd_pcm_readi(capture_pcm, buf, frames);
+
+        if (n == -EPIPE) {
+            /* Overrun — recover and continue */
+            snd_pcm_prepare(capture_pcm);
+            continue;
+        } else if (n < 0) {
+            int err = snd_pcm_recover(capture_pcm, (int) n, 0);
+
+            if (err < 0) {
+                fprintf(stderr, "audio: capture recover: %s\n",
+                        snd_strerror(err));
+                break;
+            }
+
+            continue;
+        }
+
+        modem_recv(buf, (int) n);
+    }
+
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Public API                                                          */
+/* ------------------------------------------------------------------ */
+
+void audio_init()
+{
+    int err;
+
+    /* --- Playback --- */
+    err = snd_pcm_open(&play_pcm, ALSA_DEVICE, SND_PCM_STREAM_PLAYBACK, 0);
+
+    if (err < 0) {
+        fprintf(stderr, "audio: open playback: %s\n", snd_strerror(err));
+        exit(EXIT_FAILURE);
+    }
+
+    if (set_hw_params(play_pcm, PLAY_PERIOD_FRAMES, 30) < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+    if ((err = snd_pcm_prepare(play_pcm)) < 0) {
+        fprintf(stderr, "audio: prepare playback: %s\n", snd_strerror(err));
+        exit(EXIT_FAILURE);
+    }
+
+    /* --- Capture --- */
+    err = snd_pcm_open(&capture_pcm, ALSA_DEVICE, SND_PCM_STREAM_CAPTURE, 0);
+
+    if (err < 0) {
+        fprintf(stderr, "audio: open capture: %s\n", snd_strerror(err));
+        exit(EXIT_FAILURE);
+    }
+
+    if (set_hw_params(capture_pcm, CAPTURE_PERIOD_FRAMES, 2) < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+    if ((err = snd_pcm_prepare(capture_pcm)) < 0) {
+        fprintf(stderr, "audio: prepare capture: %s\n", snd_strerror(err));
+        exit(EXIT_FAILURE);
+    }
+
+    if ((err = snd_pcm_start(capture_pcm)) < 0) {
+        fprintf(stderr, "audio: start capture: %s\n", snd_strerror(err));
+        exit(EXIT_FAILURE);
+    }
+
+    /* Spawn capture thread */
+    capture_running = true;
+
+    if (pthread_create(&capture_thread, NULL, capture_thread_fn, NULL) != 0) {
+        perror("audio: pthread_create");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void audio_send(const int16_t *buf, int len)
+{
+    if (play_pcm == NULL || buf == NULL || len == 0) {
         return;
     }
 
-    uint8_t *ptr = (uint8_t *) buf;
-    int     bytes = len * 2;
+    const int16_t *ptr   = buf;
+    int            remaining = len;   /* in frames (samples for mono) */
 
-    while (bytes > 0) {
-        size_t size;
+    while (remaining > 0) {
+        snd_pcm_sframes_t written = snd_pcm_writei(play_pcm, ptr, remaining);
 
-        pa_threaded_mainloop_lock(mloop);
-        size = pa_stream_writable_size(play_stm);
-        pa_threaded_mainloop_unlock(mloop);
+        if (written == -EPIPE) {
+            /* Underrun — recover and retry */
+            snd_pcm_prepare(play_pcm);
+            continue;
+        } else if (written < 0) {
+            int err = snd_pcm_recover(play_pcm, (int) written, 0);
 
-        if (size > 256) {
-            if (bytes < size) {
-                size = bytes;
-            } else {
-                size = 256;
-            }
-
-            pa_threaded_mainloop_lock(mloop);
-            int res = pa_stream_write(play_stm, ptr, size, NULL, 0, PA_SEEK_RELATIVE);
-            pa_threaded_mainloop_unlock(mloop);
-
-            if (res < 0) {
-                printf("pa_stream_write() failed: %s", pa_strerror(pa_context_errno(ctx)));
+            if (err < 0) {
+                fprintf(stderr, "audio: writei recover: %s\n",
+                        snd_strerror(err));
                 return;
             }
 
-            bytes -= size;
-            ptr += size;
-        } else {
-            usleep(1000);
+            continue;
         }
+
+        ptr       += written;
+        remaining -= (int) written;
     }
 }
 
-void audio_wait() {
-    pa_operation *op;
-    int r;
-
-    if (mloop == NULL || play_stm == NULL) {
+void audio_wait()
+{
+    if (play_pcm == NULL) {
         return;
     }
 
-    pa_threaded_mainloop_lock(mloop);
-    op = pa_stream_drain(play_stm, NULL, NULL);
-    pa_threaded_mainloop_unlock(mloop);
-
-    while (true) {
-        pa_threaded_mainloop_lock(mloop);
-        r = pa_operation_get_state(op);
-        pa_threaded_mainloop_unlock(mloop);
-
-        if (r == PA_OPERATION_DONE || r == PA_OPERATION_CANCELLED) {
-            break;
-        }
-
-        usleep(1000);
-    }
-
-    pa_operation_unref(op);
+    snd_pcm_drain(play_pcm);
+    snd_pcm_prepare(play_pcm);   /* ready for next audio_send() call */
 }
