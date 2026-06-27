@@ -20,3 +20,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE codec2 asound pthread gpiod m cyam
 #set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS "-save-temps")
 #target_compile_options(${PROJECT_NAME} PRIVATE -g -pg)
 #target_link_options(${PROJECT_NAME} PRIVATE -g -pg)
+
+install(FILES freedv-tnc.yaml DESTINATION /mnt/rns)
+install(TARGETS ${PROJECT_NAME} DESTINATION sbin)
